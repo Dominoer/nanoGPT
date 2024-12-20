@@ -78,7 +78,7 @@ torchrun --standalone --nproc_per_node=1 train.py config/train_enwik8.py
 To evaluate a trained model:
 ```bash
 python eval.py \
-    --model_dir path_to_model/ \
+    --model_dir out-enwik8_baseline_150k/ \
     --test_data data/enwik8/test.bin \
     --batch_size 32 \
     --block_size 512 \
@@ -91,3 +91,18 @@ Parameters:
 - `--batch_size`: Batch size for evaluation (default: 32)
 - `--block_size`: Context size (default: 512)
 - `--plot`: Enable plotting of position-wise loss (optional)
+
+
+## Credits and Acknowledgments
+
+This project is built upon [nanoGPT](https://github.com/karpathy/nanoGPT) by Andrej Karpathy, which provides the core implementation of a minimal GPT training framework. We express our gratitude to Karpathy for making this excellent educational resource available to the community.
+
+Additionally, specific components were adapted from the following sources:
+
+- The evaluation script (`eval.py`) was adapted from the Transformer-XL implementation:
+  - Source: [transformer-xl/pytorch/eval.py](https://github.com/kimiyoung/transformer-xl/blob/master/pytorch/eval.py)
+
+- The Enwik8 data preparation script (`data/enwik8/prepare.py`) was adapted from:
+  - Source: [nanoGPT PR #254](https://github.com/karpathy/nanoGPT/pull/254)
+
+We thank all the original authors for making their code available.
