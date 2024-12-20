@@ -78,30 +78,39 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-
+# Type hint for supported weighting methods
 WeightingMethod = Literal['exp', 'power', 'step', 'sharp_cutoff']
 
 class ProgressiveLoss:
-    """
-    A custom loss function that progressively adjusts the weight of different positions
-    during training, based on PyTorch's cross entropy loss.
+    """A curriculum learning loss function for transformer models.
     
-    This loss function is for training sequence transformer models where you want
-    to gradually increase the difficulty of the prediction task over training iterations.
+    This loss function implements a curriculum learning strategy by dynamically
+    adjusting the weight of different positions during training. It gives higher
+    importance to predictions with more context in early training, then gradually
+    transitions to uniform weighting.
+    
+    The key insight is that positions later in a sequence have more context for
+    prediction, making them "easier" learning targets initially. The weighting
+    smoothly transitions to treat all positions equally as training progresses.
     
     Args:
-        max_iters (int): Total number of training iterations
-        use_prog (bool, optional): Whether to use progressive weighting. Defaults to True.
-        prog_ratio (float, optional): Ratio of total iterations to use for progression. 
-            Defaults to 0.2.
-        prog_weighting (WeightingMethod, optional): Method to calculate position weights.
-            Options: 'exp', 'power', 'step', 'sharp_cutoff'. Defaults to 'exp'.
-        block_size (int, optional): Maximum sequence length. Defaults to 512.
-        
-    Examples:
-        >>> criterion = ProgressiveLoss(max_iters=1000)
-        >>> output = model(input)
-        >>> loss = criterion(output, target)
+        max_iters: Total number of training iterations.
+        use_prog: Whether to use progressive weighting (if False, uses standard cross entropy).
+        prog_ratio: Fraction of total iterations to use for progression (e.g., 0.2 = first 20%).
+        prog_weighting: Method to calculate position weights:
+            - 'exp': Exponential weighting (smoothest transition)
+            - 'power': Power-law weighting (moderate transition)
+            - 'step': Sigmoid step function (sharper transition)
+            - 'sharp_cutoff': Binary weighting (abrupt transition)
+        block_size: Maximum sequence length (needed for weight normalization).
+    
+    Example:
+        >>> # Initialize with 1000 total iterations, using first 200 for progression
+        >>> criterion = ProgressiveLoss(max_iters=1000, prog_ratio=0.2)
+        >>> 
+        >>> # During training:
+        >>> outputs = model(inputs)
+        >>> loss = criterion(outputs, targets)
         >>> loss.backward()
     """
     
@@ -113,38 +122,52 @@ class ProgressiveLoss:
         prog_weighting: WeightingMethod = 'exp',
         block_size: int = 512,
     ):
+        # Input validation
         if not 0 < prog_ratio <= 1:
             raise ValueError("prog_ratio must be between 0 and 1")
         if max_iters <= 0:
             raise ValueError("max_iters must be positive")
             
         self.use_prog = use_prog
-        self.prog_iters = math.floor(prog_ratio * max_iters)
+        self.prog_iters = math.floor(prog_ratio * max_iters)  # Number of progressive iterations
         self.prog_weighting = prog_weighting
-        self.count = 0
+        self.count = 0  # Current iteration counter
         self.max_context = block_size
         
     def get_position_weights(self, positions: torch.Tensor) -> torch.Tensor:
-        """
-        Calculate weights for each position based on training progress.
+        """Calculate the importance weight for each position based on training progress.
+        
+        The weights determine how much each position contributes to the loss.
+        Early in training, later positions (with more context) get higher weights.
+        As training progresses, the weights become more uniform.
         
         Args:
-            positions (torch.Tensor): Tensor of position indices
+            positions: Tensor of position indices (0 to sequence_length - 1)
             
         Returns:
-            torch.Tensor: Position weights of same shape as input
+            Tensor of weights, same shape as positions, normalized to maintain loss scale
         """
-            
+        # Calculate current progress (0.0 to 1.0) through progressive phase    
         progress = min(1.0, self.count / self.prog_iters)
+        
+        # Normalize positions to 0.0-1.0 range for consistent scaling
         pos_normalized = positions.float() / self.max_context
         
+        # Apply the selected weighting method
         if self.prog_weighting == 'exp':
+            # Exponential weighting: smooth transition from focused to uniform
             weights = torch.exp((1 - progress) * pos_normalized)
+            
         elif self.prog_weighting == 'power':
+            # Power-law weighting: more aggressive early focus
             weights = (1 + pos_normalized) ** (3 * (1 - progress))
+            
         elif self.prog_weighting == 'step':
+            # Sigmoid step: creates a moving cutoff point
             weights = 1 + torch.sigmoid((pos_normalized - progress) * 10) * 2
+            
         elif self.prog_weighting == 'sharp_cutoff':
+            # Binary weighting: abrupt transition between focused and uniform
             cutoff = 1 - progress
             weights = torch.where(
                 pos_normalized > cutoff,
@@ -157,66 +180,67 @@ class ProgressiveLoss:
                 "Must be one of: 'exp', 'power', 'step', 'sharp_cutoff'"
             )
         
-        # Normalize weights
+        # Normalize weights to maintain the same scale as regular cross entropy
         scale = positions.size(0)
         weights = weights * scale / weights.sum()
         
         return weights
         
     def apply_weight(self, loss: torch.Tensor) -> torch.Tensor:
-        """
-        Apply position-based weights to the loss tensor while maintaining
-        the same scale as regular cross entropy loss per sequence.
+        """Apply position-based weights to the per-token losses.
         
         Args:
-            loss (torch.Tensor): Loss tensor of shape (batch_size, seq_len, vocab_size)
+            loss: Per-position losses of shape (batch_size, seq_len)
             
         Returns:
-            torch.Tensor: Weighted mean loss (scalar)
+            Weighted mean loss (scalar) with same scale as regular cross entropy
         """
         batch_size, seq_len = loss.size()
+        
+        # Generate position indices for the sequence
         positions = torch.arange(0, seq_len, dtype=torch.long, device=loss.device)
         
-        # Get and expand weights to match batch dimension
+        # Calculate and expand weights to match batch dimension
         weights = self.get_position_weights(positions).to(loss.device)
         weights = weights.expand(batch_size, -1)
         
-        # Apply weights and record iteration number
+        # Apply weights and increment iteration counter
         weighted_loss = loss * weights
         self.count += 1
         
         return weighted_loss.mean()
     
     def __call__(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        Calculate the progressive loss.
+        """Calculate the loss for a batch of predictions.
         
         Args:
-            logits (torch.Tensor): Predicted logits of shape (batch_size, seq_len)
-            targets (torch.Tensor): Target indices of shape (batch_size, seq_len)
+            logits: Model predictions of shape (batch_size, seq_len, vocab_size)
+            targets: Target token indices of shape (batch_size, seq_len)
             
         Returns:
-            torch.Tensor: Scalar loss value with same scale as regular cross entropy
+            Scalar loss value (same scale as regular cross entropy)
         """
+        # Use standard cross entropy if progression is disabled or complete
         if not self.use_prog or self.count >= self.prog_iters:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+            return F.cross_entropy(
+                logits.view(-1, logits.size(-1)), 
+                targets.view(-1), 
+                ignore_index=-1
             )
-            return loss
-        else:
-            batch_size, seq_len = logits.size()[:2]
             
-            # Calculate per-position loss
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-1,
-                reduction='none'
-            )
-            loss = loss.view(batch_size, seq_len)
-            
-            # Apply progressive weighting
-            return self.apply_weight(loss)
+        batch_size, seq_len = logits.size()[:2]
+        
+        # Calculate per-position losses
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=-1,
+            reduction='none'
+        )
+        loss = loss.view(batch_size, seq_len)
+        
+        # Apply progressive weighting
+        return self.apply_weight(loss)
 
 
 class MLP(nn.Module):
