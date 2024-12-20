@@ -10,6 +10,8 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from typing import Literal, Union, Optional
+import math
 
 import torch
 import torch.nn as nn
@@ -26,6 +28,7 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+        
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -53,7 +56,7 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2) # B, T, C -> B, T, 3*C
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -74,6 +77,147 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
+
+
+WeightingMethod = Literal['exp', 'power', 'step', 'sharp_cutoff']
+
+class ProgressiveLoss:
+    """
+    A custom loss function that progressively adjusts the weight of different positions
+    during training, based on PyTorch's cross entropy loss.
+    
+    This loss function is for training sequence transformer models where you want
+    to gradually increase the difficulty of the prediction task over training iterations.
+    
+    Args:
+        max_iters (int): Total number of training iterations
+        use_prog (bool, optional): Whether to use progressive weighting. Defaults to True.
+        prog_ratio (float, optional): Ratio of total iterations to use for progression. 
+            Defaults to 0.2.
+        prog_weighting (WeightingMethod, optional): Method to calculate position weights.
+            Options: 'exp', 'power', 'step', 'sharp_cutoff'. Defaults to 'exp'.
+        block_size (int, optional): Maximum sequence length. Defaults to 512.
+        
+    Examples:
+        >>> criterion = ProgressiveLoss(max_iters=1000)
+        >>> output = model(input)
+        >>> loss = criterion(output, target)
+        >>> loss.backward()
+    """
+    
+    def __init__(
+        self,
+        max_iters: int,
+        use_prog: bool = True,
+        prog_ratio: float = 0.2,
+        prog_weighting: WeightingMethod = 'exp',
+        block_size: int = 512,
+    ):
+        if not 0 < prog_ratio <= 1:
+            raise ValueError("prog_ratio must be between 0 and 1")
+        if max_iters <= 0:
+            raise ValueError("max_iters must be positive")
+            
+        self.use_prog = use_prog
+        self.prog_iters = math.floor(prog_ratio * max_iters)
+        self.prog_weighting = prog_weighting
+        self.count = 0
+        self.max_context = block_size
+        
+    def get_position_weights(self, positions: torch.Tensor) -> torch.Tensor:
+        """
+        Calculate weights for each position based on training progress.
+        
+        Args:
+            positions (torch.Tensor): Tensor of position indices
+            
+        Returns:
+            torch.Tensor: Position weights of same shape as input
+        """
+            
+        progress = min(1.0, self.count / self.prog_iters)
+        pos_normalized = positions.float() / self.max_context
+        
+        if self.prog_weighting == 'exp':
+            weights = torch.exp((1 - progress) * pos_normalized)
+        elif self.prog_weighting == 'power':
+            weights = (1 + pos_normalized) ** (3 * (1 - progress))
+        elif self.prog_weighting == 'step':
+            weights = 1 + torch.sigmoid((pos_normalized - progress) * 10) * 2
+        elif self.prog_weighting == 'sharp_cutoff':
+            cutoff = 1 - progress
+            weights = torch.where(
+                pos_normalized > cutoff,
+                torch.ones_like(pos_normalized) * 3,
+                torch.ones_like(pos_normalized) * 0.5
+            )
+        else:
+            raise ValueError(
+                f"Invalid prog_weighting method: {self.prog_weighting}. "
+                "Must be one of: 'exp', 'power', 'step', 'sharp_cutoff'"
+            )
+        
+        # Normalize weights
+        scale = positions.size(0)
+        weights = weights * scale / weights.sum()
+        
+        return weights
+        
+    def apply_weight(self, loss: torch.Tensor) -> torch.Tensor:
+        """
+        Apply position-based weights to the loss tensor while maintaining
+        the same scale as regular cross entropy loss per sequence.
+        
+        Args:
+            loss (torch.Tensor): Loss tensor of shape (batch_size, seq_len, vocab_size)
+            
+        Returns:
+            torch.Tensor: Weighted mean loss (scalar)
+        """
+        batch_size, seq_len = loss.size()
+        positions = torch.arange(0, seq_len, dtype=torch.long, device=loss.device)
+        
+        # Get and expand weights to match batch dimension
+        weights = self.get_position_weights(positions).to(loss.device)
+        weights = weights.expand(batch_size, -1)
+        
+        # Apply weights and record iteration number
+        weighted_loss = loss * weights
+        self.count += 1
+        
+        return weighted_loss.mean()
+    
+    def __call__(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Calculate the progressive loss.
+        
+        Args:
+            logits (torch.Tensor): Predicted logits of shape (batch_size, seq_len)
+            targets (torch.Tensor): Target indices of shape (batch_size, seq_len)
+            
+        Returns:
+            torch.Tensor: Scalar loss value with same scale as regular cross entropy
+        """
+        if not self.use_prog or self.count >= self.prog_iters:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+            )
+            return loss
+        else:
+            batch_size, seq_len = logits.size()[:2]
+            
+            # Calculate per-position loss
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+                reduction='none'
+            )
+            loss = loss.view(batch_size, seq_len)
+            
+            # Apply progressive weighting
+            return self.apply_weight(loss)
+
 
 class MLP(nn.Module):
 
@@ -114,6 +258,10 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    max_iters: int = 300000
+    use_prog: bool = True
+    prog_ratio: float = 0.2
+    prog_weighting: WeightingMethod = 'exp'
 
 class GPT(nn.Module):
 
@@ -122,7 +270,7 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-
+        # print('weighting iters', config.weighting_iters)
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -143,6 +291,12 @@ class GPT(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+        # use custome progressive loss func
+        self.criterion = ProgressiveLoss(
+            max_iters=config.max_iters, use_prog=config.use_prog,
+            prog_ratio=config.prog_ratio, prog_weighting=config.prog_weighting,
+            block_size=config.block_size
+        )
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -170,24 +324,21 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = self.criterion(logits, targets)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :])
             loss = None
 
         return logits, loss
